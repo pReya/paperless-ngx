@@ -18,6 +18,10 @@ rendering and the response validation. Only two things are replaced:
 Run on ``dev`` these tests fail and their assertion messages show what the
 model was shown and what came back. Run on the feature branch they pass.
 See ``e2e/README.md`` for the before/after runner.
+
+With ``--real-llm`` the scripted stand-in is replaced by a real
+OpenAI-compatible model (see ``conftest.py`` for endpoint/model options) and
+the same assertions become an empirical check of that model's behaviour.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from documents.models import MatchingModel
 from paperless_ai.ai_classifier import get_ai_document_classification
 from paperless_ai.base_model import DocumentClassifierSchema
 from paperless_ai.base_model import model_to_classification_suggestions
+from paperless_ai.client import AIClient
 from paperless_testing.factories import CorrespondentFactory
 from paperless_testing.factories import DocumentFactory
 from paperless_testing.factories import TagFactory
@@ -178,13 +183,46 @@ def scripted_model(seen: list[dict[str, Any]]) -> Callable[..., Any]:
     return run_llm_query
 
 
+def recording_real_model(seen: list[dict[str, Any]]) -> Callable[..., Any]:
+    """Wrap the real ``run_llm_query`` so each call records what the prompt
+    offered and what came back after validation."""
+    original = AIClient.run_llm_query
+
+    def run_llm_query(self, prompt: str, *, allowed_candidate_ids=None):
+        result = original(self, prompt, allowed_candidate_ids=allowed_candidate_ids)
+        record = {
+            "offered": _candidates_in_prompt(prompt),
+            "answer": {
+                "tags": result["tags"],
+                "correspondents": result["correspondents"],
+            },
+        }
+        seen.append(record)
+        # Visible with `pytest -s`, so passing runs show the model's answer too.
+        print(f"\nLLM> offered:  {json.dumps(record['offered'])}")  # noqa: T201
+        print(f"LLM> answered: {json.dumps(record['answer'])}")  # noqa: T201
+        return result
+
+    return run_llm_query
+
+
 @pytest.fixture
-def model_calls(mocker: pytest_mock.MockerFixture) -> list[dict[str, Any]]:
+def model_calls(
+    mocker: pytest_mock.MockerFixture,
+    real_llm: dict | None,
+) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
-    mocker.patch(
-        "paperless_ai.client.AIClient.run_llm_query",
-        side_effect=scripted_model(calls),
-    )
+    if real_llm is None:
+        mocker.patch(
+            "paperless_ai.client.AIClient.run_llm_query",
+            side_effect=scripted_model(calls),
+        )
+    else:
+        mocker.patch.object(
+            AIClient,
+            "run_llm_query",
+            new=recording_real_model(calls),
+        )
     return calls
 
 
@@ -214,10 +252,20 @@ def explain(calls: list[dict[str, Any]], result) -> str:
 
 
 @pytest.fixture(autouse=True)
-def ai_settings(settings) -> None:
-    settings.LLM_BACKEND = "ollama"
-    settings.LLM_MODEL = "some_model"
+def ai_settings(settings, real_llm: dict | None) -> None:
+    # The vector path is selected but retrieve_similar_nodes is always
+    # replaced, so no embedding model is ever loaded.
     settings.LLM_EMBEDDING_BACKEND = "huggingface"
+    if real_llm is None:
+        settings.LLM_BACKEND = "ollama"
+        settings.LLM_MODEL = "some_model"
+    else:
+        settings.LLM_BACKEND = "openai-like"
+        settings.LLM_ENDPOINT = real_llm["endpoint"]
+        settings.LLM_MODEL = real_llm["model"]
+        settings.LLM_API_KEY = "not-needed"
+        settings.LLM_ALLOW_INTERNAL_ENDPOINTS = True
+        settings.LLM_REQUEST_TIMEOUT = 600
 
 
 @pytest.mark.django_db
