@@ -4,8 +4,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 
 from documents.models import Document
-from documents.permissions import permitted_object_ids
-from documents.permissions import restrict_queryset_to_visible
+from documents.permissions import permitted_document_ids
 from documents.permissions import user_is_unrestricted
 from paperless.config import AIConfig
 from paperless_ai.base_model import ClassificationSuggestions
@@ -25,6 +24,7 @@ from paperless_ai.taxonomy import _node_document_weights
 from paperless_ai.taxonomy import build_taxonomy_candidates
 from paperless_ai.taxonomy import empty_taxonomy_candidates
 from paperless_ai.taxonomy import format_taxonomy_for_prompt
+from paperless_ai.taxonomy import merge_matched_candidates
 
 logger = logging.getLogger("paperless_ai.rag_classifier")
 
@@ -54,8 +54,8 @@ def _fulltext_similar_documents(
     active superuser - see user_is_unrestricted) is normalized to ``None``
     before calling, since the backend's permission filter has no superuser
     short-circuit of its own. Results are re-checked with
-    restrict_queryset_to_visible() since Tantivy's indexed permission fields
-    lag the DB via async reindexing.
+    permitted_document_ids() since Tantivy's indexed permission fields lag the
+    DB via async reindexing and judge a version by its own owner.
     """
     from documents.search import get_backend
 
@@ -69,10 +69,9 @@ def _fulltext_similar_documents(
     )
     if not unrestricted:
         allowed_ids = set(
-            restrict_queryset_to_visible(
-                Document.objects.filter(pk__in=similar_ids),
-                user,
-                "view_document",
+            Document.objects.filter(
+                pk__in=similar_ids,
+                id__in=permitted_document_ids(user),
             ).values_list("pk", flat=True),
         )
         similar_ids = [doc_id for doc_id in similar_ids if doc_id in allowed_ids]
@@ -184,10 +183,12 @@ def get_taxonomy_context(
     """One retrieval feeds both taxonomy candidates and RAG text context. Uses
     vector similarity when an embedding backend is configured, otherwise
     falls back to Tantivy full-text "More Like This" similarity - see
-    _fulltext_similar_documents. On any retrieval failure, degrades to empty
-    candidates/context rather than propagating the exception - neither a
-    vector-store outage nor a search-index issue should block classification,
-    only its context-assisted enrichment.
+    _fulltext_similar_documents. The neighbour-derived candidates are then
+    merged with matching-rule and classifier hits (merge_matched_candidates),
+    which does not depend on retrieval. On any retrieval failure, degrades to
+    an empty context and matched-only candidates rather than propagating the
+    exception - neither a vector-store outage nor a search-index issue should
+    block classification, only its context-assisted enrichment.
     """
     ai_config = AIConfig()
     try:
@@ -200,13 +201,13 @@ def get_taxonomy_context(
             # quadratic scan in the vector store at best, and past ~32,763
             # documents a hard sqlite3.OperationalError (SQLite's
             # bound-parameter limit) at worst.
-            # permitted_object_ids() has its own superuser shortcut that would
+            # permitted_document_ids() has its own superuser shortcut that would
             # return every Document's id anyway, so this changes nothing about
             # which documents are considered -- only how we get there.
             visible_document_ids = (
                 None
                 if user_is_unrestricted(user)
-                else list(permitted_object_ids(user, Document, "view_document"))
+                else list(permitted_document_ids(user))
             )
             nodes = retrieve_similar_nodes(
                 document,
@@ -238,15 +239,19 @@ def get_taxonomy_context(
             text = similar.content[:1000] or ""
             title = similar.title or similar.filename or "Untitled"
             context_blocks.append(f"TITLE: {title}\n{text}")
+        context = "\n\n".join(context_blocks)
     except Exception:
         logger.exception(
             "Failed to retrieve similar-document context for document %s; "
-            "continuing without taxonomy candidates or similar-document context.",
+            "continuing without neighbour-derived taxonomy candidates or "
+            "similar-document context.",
             document.pk,
         )
-        return empty_taxonomy_candidates(), ""
+        candidates, context = empty_taxonomy_candidates(), ""
 
-    return candidates, "\n\n".join(context_blocks)
+    # Independent of retrieval: matching rules and the trained classifier
+    # still supply candidates when there are no (or no useful) neighbours.
+    return merge_matched_candidates(candidates, document, user), context
 
 
 def parse_ai_response(raw: dict) -> ClassificationSuggestions:

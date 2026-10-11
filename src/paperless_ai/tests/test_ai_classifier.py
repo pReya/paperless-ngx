@@ -552,7 +552,7 @@ class TestGetTaxonomyContextVisibility:
             return_value=[],
         )
         mock_permitted = mocker.patch(
-            "paperless_ai.ai_classifier.permitted_object_ids",
+            "paperless_ai.ai_classifier.permitted_document_ids",
         )
         user = UserFactory.create(is_superuser=True)
 
@@ -582,7 +582,7 @@ class TestGetTaxonomyContextVisibility:
             return_value=[],
         )
         mock_permitted = mocker.patch(
-            "paperless_ai.ai_classifier.permitted_object_ids",
+            "paperless_ai.ai_classifier.permitted_document_ids",
         )
 
         get_taxonomy_context(document, None)
@@ -611,15 +611,54 @@ class TestGetTaxonomyContextVisibility:
             return_value=[],
         )
         mock_permitted = mocker.patch(
-            "paperless_ai.ai_classifier.permitted_object_ids",
+            "paperless_ai.ai_classifier.permitted_document_ids",
             return_value=[1, 2, 3],
         )
         user = UserFactory.create(is_superuser=False)
 
         get_taxonomy_context(document, user)
 
-        mock_permitted.assert_called_once_with(user, Document, "view_document")
+        mock_permitted.assert_called_once_with(user)
         assert mock_retrieve.call_args.kwargs["document_ids"] == [1, 2, 3]
+
+    @pytest.mark.django_db
+    @override_settings(LLM_EMBEDDING_BACKEND="huggingface")
+    def test_version_of_private_root_is_not_visible(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """
+        GIVEN:
+            - A private root document owned by someone else
+            - A version of it whose own owner is unset, as when the root
+              changed hands after the version was created
+        WHEN:
+            - get_taxonomy_context() is called for a non-superuser
+        THEN:
+            - Neither the root nor the version is in the visible ids passed to
+              retrieve_similar_nodes(), since a version follows its root
+        """
+        owner = UserFactory.create()
+        viewer = UserFactory.create(is_superuser=False)
+        root = DocumentFactory.create(content="private", owner=owner)
+        version = DocumentFactory.create(
+            content="private",
+            owner=None,
+            root_document=root,
+            version_index=1,
+        )
+        source = DocumentFactory.create(content="Some content", owner=viewer)
+        mock_retrieve = mocker.patch(
+            "paperless_ai.ai_classifier.retrieve_similar_nodes",
+            return_value=[],
+        )
+
+        get_taxonomy_context(source, viewer)
+
+        visible = mock_retrieve.call_args.kwargs["document_ids"]
+        assert source.pk in visible
+        assert root.pk not in visible
+        assert version.pk not in visible
 
 
 @pytest.mark.django_db
@@ -803,7 +842,7 @@ class TestFulltextSimilarDocuments:
             - _fulltext_similar_documents() is called with that user
         THEN:
             - Only the still-permitted document is returned - the DB
-              re-check via restrict_queryset_to_visible() must catch the
+              re-check via permitted_document_ids() must catch the
               document Tantivy's stale index still thinks is visible
         """
         owner = UserFactory.create()
@@ -833,6 +872,45 @@ class TestFulltextSimilarDocuments:
         result = _fulltext_similar_documents(source, user=viewer, top_k=5)
 
         assert [s["document_id"] for s in result] == [permitted.pk]
+
+    def test_excludes_version_of_private_root_for_regular_user(
+        self,
+        fulltext_backend: TantivyBackend,
+    ) -> None:
+        """
+        GIVEN:
+            - A regular user and a private root owned by someone else
+            - A version of that root with no owner of its own, which the
+              Tantivy index therefore treats as visible to everyone
+        WHEN:
+            - _fulltext_similar_documents() is called with that user
+        THEN:
+            - The version is not returned, since the DB re-check judges it by
+              its root
+        """
+        owner = UserFactory.create()
+        viewer = UserFactory.create(is_superuser=False)
+        source = DocumentFactory.create(
+            content="shared content phrase",
+            owner=viewer,
+        )
+        root = DocumentFactory.create(
+            content="shared content phrase",
+            owner=owner,
+        )
+        version = DocumentFactory.create(
+            content="shared content phrase",
+            owner=None,
+            root_document=root,
+            version_index=1,
+        )
+        fulltext_backend.add_or_update(source)
+        fulltext_backend.add_or_update(root)
+        fulltext_backend.add_or_update(version)
+
+        result = _fulltext_similar_documents(source, user=viewer, top_k=5)
+
+        assert version.pk not in [s["document_id"] for s in result]
 
 
 @pytest.mark.django_db
@@ -894,6 +972,84 @@ def test_get_taxonomy_context_candidate_building_failure_degrades_to_no_hints(
         "correspondents": [],
         "storage_paths": [],
     }
+    assert rag_context == ""
+
+
+@pytest.mark.django_db
+@override_settings(LLM_EMBEDDING_BACKEND="huggingface")
+@patch("paperless_ai.ai_classifier.merge_matched_candidates")
+@patch("paperless_ai.ai_classifier.retrieve_similar_nodes")
+def test_get_taxonomy_context_merges_matched_candidates(
+    mock_retrieve,
+    mock_merge,
+):
+    """
+    GIVEN:
+        - A neighbour document with a tag is retrieved
+    WHEN:
+        - get_taxonomy_context() is called with a user
+    THEN:
+        - The neighbour-derived candidates, the document and the user are
+          handed to merge_matched_candidates(), whose result is returned
+    """
+    tag = TagFactory.create(name="Bloodwork")
+    neighbour = DocumentFactory.create(content="Neighbour content")
+    neighbour.tags.add(tag)
+    document = DocumentFactory.create(content="Some content")
+    user = UserFactory.create(is_superuser=True)
+    mock_retrieve.return_value = [
+        SimpleNamespace(metadata={"document_id": str(neighbour.pk)}, score=0.8),
+    ]
+    merged = {
+        "tags": [{"id": tag.pk, "name": "Bloodwork", "weight": 9.0}],
+        "document_types": [],
+        "correspondents": [],
+        "storage_paths": [],
+    }
+    mock_merge.return_value = merged
+
+    candidates, _rag_context = get_taxonomy_context(document, user=user)
+
+    assert candidates is merged
+    mock_merge.assert_called_once()
+    neighbour_candidates, merge_document, merge_user = mock_merge.call_args.args
+    assert neighbour_candidates["tags"][0]["id"] == tag.pk
+    assert merge_document == document
+    assert merge_user == user
+
+
+@pytest.mark.django_db
+@override_settings(LLM_EMBEDDING_BACKEND="huggingface")
+@patch("paperless_ai.ai_classifier.merge_matched_candidates")
+@patch("paperless_ai.ai_classifier.retrieve_similar_nodes")
+def test_get_taxonomy_context_retrieval_failure_still_merges_matched_candidates(
+    mock_retrieve,
+    mock_merge,
+):
+    """
+    GIVEN:
+        - retrieve_similar_nodes() raises (e.g. vector store outage)
+    WHEN:
+        - get_taxonomy_context() is called
+    THEN:
+        - merge_matched_candidates() still runs, on empty neighbour
+          candidates, so matching rules and the classifier keep supplying
+          candidates without any retrieval
+    """
+    document = DocumentFactory.create(content="Some content")
+    mock_retrieve.side_effect = RuntimeError("vector store unavailable")
+    mock_merge.side_effect = lambda candidates, *_: candidates
+
+    candidates, rag_context = get_taxonomy_context(document, user=None)
+
+    mock_merge.assert_called_once()
+    assert mock_merge.call_args.args[0] == {
+        "tags": [],
+        "document_types": [],
+        "correspondents": [],
+        "storage_paths": [],
+    }
+    assert candidates == mock_merge.call_args.args[0]
     assert rag_context == ""
 
 
